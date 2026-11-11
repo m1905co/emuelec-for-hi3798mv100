@@ -1,0 +1,42 @@
+#!/bin/sh
+# S97a4-cpufreq - 开机套用 a4-perf 配置
+#
+# 配置项（可手动编辑，也可用 `a4-perf 1200` 这类命令改写）：
+#   /storage/.config/emuelec/configs/a4-perf.conf
+#       MAX_FREQ=1000000
+#       GOVERNOR=ondemand
+#
+# 为什么需要这个脚本：EmuELEC 默认 global.maxperf=1 会把 governor 钉死在 userspace 1.2GHz，
+# 空闲也满载；而 performance 模式更糟——电压被拉到 1.5GHz 档的 1495mV，频率却只有 1.2GHz，
+# 实测 82°C。本脚本在 S95(起前端) 之后延迟 6 秒执行，覆盖掉 maxperf 的结果。
+#
+# 路径坑：频率控制在 cpu0/cpufreq/，ondemand 调参在 cpufreq/ondemand/（无 cpu0）。
+D=/sys/devices/system/cpu/cpu0/cpufreq
+OD=/sys/devices/system/cpu/cpufreq/ondemand
+CONF=/storage/.config/emuelec/configs/a4-perf.conf
+
+MAXF=$(sed -n 's/^MAX_FREQ=//p' "$CONF" 2>/dev/null)
+GOV=$(sed -n 's/^GOVERNOR=//p' "$CONF" 2>/dev/null)
+[ -n "$MAXF" ] || MAXF=1000000
+[ -n "$GOV" ] || GOV=ondemand
+
+case "${1:-start}" in
+start)
+    (
+        sleep 6
+        [ -w "$D/scaling_max_freq" ] || exit 0
+        echo "$MAXF" > "$D/scaling_max_freq" 2>/dev/null
+        echo "$GOV"  > "$D/scaling_governor" 2>/dev/null
+        if [ "$GOV" = "ondemand" ]; then
+            echo 70    > "$OD/up_threshold"         2>/dev/null
+            echo 20000 > "$OD/sampling_rate"        2>/dev/null
+            echo 4     > "$OD/sampling_down_factor" 2>/dev/null
+        fi
+        echo "a4-cpufreq: max=$MAXF gov=$(cat "$D/scaling_governor" 2>/dev/null) cur=$(cat "$D/scaling_cur_freq" 2>/dev/null)" >&2
+    ) &
+    ;;
+stop)
+    echo userspace > "$D/scaling_governor" 2>/dev/null
+    ;;
+esac
+exit 0

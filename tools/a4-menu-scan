@@ -1,0 +1,31 @@
+#!/bin/sh
+# a4-menu-scan — 扫描周边 WiFi，写入 nets.list，并刷新首页 NETWORK 列表
+#
+# 由 /storage/ee/network/net-scan.sh 调用；也可直接执行。
+
+ROOT=/storage/ee
+OUT=$ROOT/nets.list
+LOG=$ROOT/logs/net.log
+
+mkdir -p "$ROOT" "$ROOT/logs"
+
+# 已知密码（当前保存的那个网络）
+KNOWN=$(sed -n 's/^wifi\.ssid=//p' /storage/.config/emuelec/configs/emuelec.conf 2>/dev/null | head -1)
+
+echo "$(date '+%F %T') scan start" >>"$LOG" 2>/dev/null
+
+/usr/bin/a4-wifi scan 2>/dev/null | awk -v known="$KNOWN" '
+    {
+        ssid = substr($0, 1, 32)
+        gsub(/[ \t]+$/, "", ssid)
+        sig = $2
+        enc = $3
+        if (ssid == "") next
+        printf "%s|%s|%s|%d\n", ssid, sig, enc, (ssid == known ? 1 : 0)
+    }
+' >"$OUT"
+
+echo "$(date '+%F %T') found $(wc -l <"$OUT") APs" >>"$LOG" 2>/dev/null
+
+/usr/bin/a4-menu >/dev/null 2>&1
+echo done

@@ -1,0 +1,155 @@
+#!/bin/sh
+#
+# S93a4-androidroms -- 让 EmuELEC 使用安卓 userdata 的剩余空间放 ROM
+#
+# 背景：
+#   安卓分区表 p16(userdata) 起点 = 1302 MiB = 1365245952 字节，2.3 GB。
+#   EmuELEC 自己的分区表把这段区域整体当成 p10(userdata)，但 442 MiB 起的
+#   p10 还会顺带压住安卓的 cache/system —— 所以绝不能按 EmuELEC 的 p10 用。
+#   这里改用"整盘偏移 + loop"精确对准安卓 p16，绕开一切冲突。
+#
+# 安全边界（"别的完全不动"）：
+#   1. 只把 <userdata>/media/0/EmuELEC 这一个子树 bind 到 /storage/android-roms，
+#      EmuELEC 的 ES 只能看见这一个目录，看不到 /data 下任何别的东西。
+#   2. 代码路径永远不触碰 userdata 里其它 inode。
+#   3. 关机时 inittab 的 `umount -a -r` 会干净卸载，ext4 journal 收尾干净。
+#   4. 万一 rw 挂载失败（比如上次硬断电导致 fs 需要修复），自动降级为只读，
+#      绝不做强制修复。
+#
+# 唯一无法避免的副作用：ext4 是日志文件系统，写入本目录时 journal 区域
+# 会在文件系统层被更新（这是机制，不是数据改动）。硬断电可能导致该次
+# journal 变脏，安卓下次开机会自动 replay，通常自愈。
+
+OFS=1365245952          # 1302 MiB —— 安卓 p16(userdata) 起始字节
+MNT=/mnt/android
+BIND=/storage/android-roms
+SUB=media/0/EmuELEC
+LOG=/storage/ee/logs/a4-androidroms.log
+LOOPFILE=/tmp/a4-androidroms.loop
+
+say() { echo "[a4-androidroms] $*" >>"$LOG" 2>/dev/null; }
+
+find_loop() {
+    L=$(losetup -f 2>/dev/null)
+    [ -n "$L" ] && echo "$L" && return 0
+    for i in 0 1 2 3 4 5 6 7; do
+        [ -e "/dev/loop$i" ] || continue
+        losetup -a 2>/dev/null | grep -q "^/dev/loop$i:" || { echo "/dev/loop$i"; return 0; }
+    done
+    return 1
+}
+
+#
+# 存档目录重定向（savefiles / savestates / screenshots / playlists）
+# RetroArch 的这四个路径由 run-retroarch.sh 硬编码为 ${STORAGE_ROOT}/xxx，
+# 而 STORAGE_ROOT 就是 /storage（p9，只剩 20 多 MB）。这里用软链接把实际
+# 写入重定向到安卓 userdata 的 1.9 GB 空间里，**不改任何系统脚本**，
+# 所以 EmuELEC 升级也不会被覆盖。
+#
+# 挂载失败时（比如安卓分区损坏）自动回退成普通本地目录，保证存档不会丢。
+SAVE_DIRS="savefiles savestates screenshots playlists"
+
+link_save_dirs() {
+    for d in $SAVE_DIRS; do
+        src="$BIND/$d"
+        dst="/storage/$d"
+        mkdir -p "$src" 2>/dev/null
+        if [ -d "$dst" ] && [ ! -L "$dst" ]; then
+            cp -a "$dst/." "$src/" 2>/dev/null
+            mv "$dst" "$dst.local" 2>/dev/null
+        fi
+        ln -sfn "$src" "$dst" 2>/dev/null && say "start: linked /storage/$d -> $src"
+    done
+}
+
+unlink_save_dirs() {
+    for d in $SAVE_DIRS; do
+        dst="/storage/$d"
+        if [ -L "$dst" ]; then
+            rm -f "$dst" 2>/dev/null
+            mkdir -p "$dst" 2>/dev/null
+            say "start: /storage/$d reverted to local dir (挂载不可用)"
+        fi
+    done
+}
+
+do_start() {
+    mkdir -p "$MNT" "$BIND" 2>/dev/null
+
+    if grep -q " $BIND " /proc/mounts 2>/dev/null; then
+        say "start: already mounted, skip"
+        return 0
+    fi
+
+    LOOP=$(find_loop) || { say "start: no free loop device"; unlink_save_dirs; return 1; }
+
+    if ! losetup -o "$OFS" "$LOOP" /dev/mmcblk0 2>>"$LOG"; then
+        say "start: losetup -o $OFS FAILED"
+        unlink_save_dirs
+        return 1
+    fi
+
+    echo "$LOOP" >"$LOOPFILE" 2>/dev/null
+
+    if mount -t ext4 -o rw,noatime "$LOOP" "$MNT" 2>>"$LOG"; then
+        say "start: mounted rw on $MNT via $LOOP"
+    elif mount -t ext4 -o ro "$LOOP" "$MNT" 2>>"$LOG"; then
+        say "start: rw FAILED -> mounted READ-ONLY (可能需先正常启动一次安卓)"
+        unlink_save_dirs          # 只读分区不能当存档目录
+        return 0
+    else
+        losetup -d "$LOOP" 2>/dev/null
+        say "start: mount ext4 FAILED entirely, giving up (系统不受影响)"
+        unlink_save_dirs
+        return 1
+    fi
+
+    # 只在 userdata 里建我们的私有目录，别的什么都不碰
+    if [ ! -d "$MNT/$SUB" ]; then
+        mkdir -p "$MNT/$SUB/roms/fbneo" "$MNT/$SUB/bios" 2>>"$LOG"
+        chmod 755 "$MNT/$SUB" "$MNT/$SUB/roms" "$MNT/$SUB/roms/fbneo" "$MNT/$SUB/bios" 2>/dev/null
+        say "start: created $SUB"
+    fi
+
+    if mount --bind "$MNT/$SUB" "$BIND" 2>>"$LOG"; then
+        say "start: bind OK  $BIND -> $SUB"
+    else
+        say "start: bind FAILED"
+        unlink_save_dirs
+        return 1
+    fi
+
+    link_save_dirs
+    AVAIL=$(df -h "$MNT" 2>/dev/null | tail -1 | awk '{print $4}')
+    say "start: done, userdata free=${AVAIL:-?}"
+    return 0
+}
+
+do_stop() {
+    sync
+    umount "$BIND" 2>/dev/null && say "stop: umounted $BIND"
+    umount "$MNT"  2>/dev/null && say "stop: umounted $MNT"
+    # 只 detach 我们自己关联的那个 loop（记在 LOOPFILE 里），避免误伤别人的 loop
+    if [ -f "$LOOPFILE" ]; then
+        L=$(cat "$LOOPFILE" 2>/dev/null)
+        if [ -n "$L" ]; then
+            losetup -d "$L" 2>/dev/null && say "stop: detached $L"
+        fi
+        rm -f "$LOOPFILE"
+    fi
+    sync
+    say "stop: done"
+    return 0
+}
+
+case "$1" in
+    start|"")  do_start ;;   # rcS 是 `$initscript` 无参调用，空的即视为 start
+    stop)    do_stop ;;
+    restart) do_stop; do_start ;;
+    status)
+        grep -q " $BIND " /proc/mounts 2>/dev/null && echo "mounted: $BIND" || echo "not mounted"
+        df -h "$MNT" 2>/dev/null | tail -1
+        losetup -a 2>/dev/null | grep mmcblk0
+        ;;
+    *) echo "usage: $0 {start|stop|restart|status}" ;;
+esac

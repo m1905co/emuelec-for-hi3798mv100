@@ -1,0 +1,229 @@
+#!/system/bin/sh
+# =============================================================================
+# a4-uv —— Hi3798MV100 降压/降温控制（root）
+#
+# 设计原则：**不在开机脚本里写死**。默认什么都不做，
+#          由用户显式 on 才生效；可随时 off 恢复；可设置是否开机自动应用。
+#
+# 用法（root shell / adb）：
+#   a4-uv status        当前频率 / 电压 / 温度 / 开关状态
+#   a4-uv on            立即降压（CPU 1.0GHz@1080mV + core 域 1000mV，AVS off）
+#   a4-uv off           恢复（AVS on、频率放开 / ondemand）
+#   a4-uv auto on|off   开机是否自动应用（默认 off）
+#   a4-uv temp          只读温度
+#   a4-uv watch         后台守护：轮询 /data/a4/uv.request，让 App 无需 root 也能改
+#
+# App（A4Tune）走的是「请求文件」这条路：
+#   App 写 /data/a4/uv.request → 本脚本的 watch 循环（root）读取并执行 → 写 uv.status
+#   因此 App 本身不需要 root，也不需要 su。
+#
+# 文件：
+#   /data/a4/uv.conf     配置（AUTO / CPU_MHZ / CPU_MV / CORE_MV）
+#   /data/a4/uv.request  App → root 的一次性请求（执行后删除）
+#   /data/a4/uv.status   当前状态快照（App 读它显示）
+#   /data/a4/uv.log      日志
+#
+# 实测边界：
+#   - pm_gpu 的 volt/freq/dvfs 写入均为 no-op，只有 avs on/off 生效 ⇒ GPU 不可调
+#   - 双降压（CPU 1080mV + core 1000mV）在 4K H265 硬解下 84°C → 80.1°C（净降≈4°C）
+#   - core 单独 −2.3°C（1000mV 为甜点，再低进平台纯冒险：core 域含 DDR）
+#   - CPU 单独 −1.6°C（边 1030mV，取 1080mV 留余量）
+# =============================================================================
+
+CONF=/data/a4/uv.conf
+REQ=/data/a4/uv.request
+STATUS=/data/a4/uv.status
+LOG=/data/a4/uv.log
+CPUDIR=/sys/devices/system/cpu/cpu0/cpufreq
+PMCPU=/proc/hisi/msp/pm_cpu
+PMCORE=/proc/hisi/msp/pm_core
+
+log() {
+    mkdir -p /data/a4 2>/dev/null
+    echo "$(date '+%m-%d %H:%M:%S') $*" >>"$LOG" 2>/dev/null
+}
+
+conf_get() {
+    [ -f "$CONF" ] && sed -n "s/^$1=//p" "$CONF" | head -1
+}
+
+conf_init() {
+    mkdir -p /data/a4 2>/dev/null
+    [ -f "$CONF" ] && return 0
+    {
+        echo "# a4-uv 配置（改完执行 a4-uv on 生效；App 也可改）"
+        echo "AUTO=0"
+        echo "CPU_MHZ=1000"
+        echo "CPU_MV=1080"
+        echo "CORE_MV=1000"
+    } >"$CONF"
+}
+
+# App 读得到的状态快照（不含 root 才有意义的东西）
+write_status() {
+    mkdir -p /data/a4 2>/dev/null
+    {
+        echo "TIME=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "AUTO=$(conf_get AUTO)"
+        echo "CPU_MHZ=$(conf_get CPU_MHZ)"
+        echo "CPU_MV=$(conf_get CPU_MV)"
+        echo "CORE_MV=$(conf_get CORE_MV)"
+        echo "CUR_KHZ=$(cat $CPUDIR/scaling_cur_freq 2>/dev/null)"
+        echo "MAX_KHZ=$(cat $CPUDIR/scaling_max_freq 2>/dev/null)"
+        echo "GOV=$(cat $CPUDIR/scaling_governor 2>/dev/null)"
+        echo "PMCPU=$(grep -E 'freq|volt|avs' $PMCPU 2>/dev/null | tr '\n' ' ')"
+        echo "PMCORE=$(grep -E 'volt' $PMCORE 2>/dev/null | head -2 | tr '\n' ' ')"
+    } >"$STATUS" 2>/dev/null
+    chmod 0644 "$STATUS" 2>/dev/null
+}
+
+need_root() {
+    [ "$(id -u)" = "0" ] && return 0
+    echo "需要 root：su -c 'a4-uv $*'"
+    return 1
+}
+
+do_status() {
+    conf_init
+    mhz=$(conf_get CPU_MHZ); mv=$(conf_get CPU_MV); cv=$(conf_get CORE_MV); au=$(conf_get AUTO)
+    echo "--- 配置 (/data/a4/uv.conf) ---"
+    echo "  开机自动应用 AUTO=$au   (1=开, 0=关)"
+    echo "  目标: CPU ${mhz:-1000}MHz @ ${mv:-1080}mV, core ${cv:-1000}mV"
+    echo "--- 当前 CPU 频率 ---"
+    echo "  cur=$(cat $CPUDIR/scaling_cur_freq 2>/dev/null)"
+    echo "  min=$(cat $CPUDIR/scaling_min_freq 2>/dev/null)  max=$(cat $CPUDIR/scaling_max_freq 2>/dev/null)"
+    echo "  governor=$(cat $CPUDIR/scaling_governor 2>/dev/null)"
+    echo "--- 电源域 (/proc/hisi/msp/pm_cpu) ---"
+    grep -E 'freq|volt|temperature|avs' "$PMCPU" 2>/dev/null | head -8
+    echo "--- core 域 ---"
+    grep -E 'volt|avs' "$PMCORE" 2>/dev/null | head -4
+    write_status
+}
+
+do_on() {
+    need_root on || return 1
+    conf_init
+    mhz=$(conf_get CPU_MHZ); [ -n "$mhz" ] || mhz=1000
+    mv=$(conf_get CPU_MV);    [ -n "$mv" ]  || mv=1080
+    cv=$(conf_get CORE_MV);   [ -n "$cv" ]  || cv=1000
+
+    echo "应用降压：CPU ${mhz}MHz @ ${mv}mV, core ${cv}mV, AVS off"
+    # 顺序不能变：先钉 OPP 再关 AVS 最后写电压，否则被温度控制线程还原
+    echo performance >"$CPUDIR/scaling_governor" 2>/dev/null
+    echo "$((mhz * 1000))" >"$CPUDIR/scaling_min_freq" 2>/dev/null
+    echo "$((mhz * 1000))" >"$CPUDIR/scaling_max_freq" 2>/dev/null
+    sleep 1
+    echo avs off >"$PMCPU" 2>/dev/null
+    sleep 1
+    echo "volt=$mv" >"$PMCPU" 2>/dev/null
+    echo "volt=$cv" >"$PMCORE" 2>/dev/null
+    log "on: cpu=${mhz}MHz/${mv}mV core=${cv}mV"
+    do_status >/dev/null 2>&1
+    echo "已应用。当前：$(grep -E 'volt' $PMCPU 2>/dev/null | head -1)"
+}
+
+do_off() {
+    need_root off || return 1
+    echo "恢复默认：AVS on，频率放开（ondemand 600M~1.5GHz，电压由 AVS 接管）"
+    echo avs on >"$PMCPU" 2>/dev/null
+    echo 600000 >"$CPUDIR/scaling_min_freq" 2>/dev/null
+    echo 1500000 >"$CPUDIR/scaling_max_freq" 2>/dev/null
+    echo ondemand >"$CPUDIR/scaling_governor" 2>/dev/null
+    log "off: restored avs on, max 1.5GHz ondemand"
+    do_status >/dev/null 2>&1
+    echo "提示：电压完全回到默认值，重启一次最干净。"
+}
+
+do_auto() {
+    conf_init
+    case "$1" in
+        on|1)
+            sed -i 's/^AUTO=.*/AUTO=1/' "$CONF"
+            log "auto=on"
+            echo "已设为开机自动应用降压"
+            ;;
+        off|0)
+            sed -i 's/^AUTO=.*/AUTO=0/' "$CONF"
+            log "auto=off"
+            echo "已取消开机自动应用（下次开机不再降压）"
+            ;;
+        *)
+            echo "用法: a4-uv auto on|off"
+            return 1
+            ;;
+    esac
+    chmod 0644 "$CONF" 2>/dev/null
+    write_status
+}
+
+do_boot() {
+    # 等 /data 挂好（首刷后 /data 是新的）
+    i=0
+    while [ $i -lt 30 ]; do
+        grep -q ' /data ' /proc/mounts && break
+        sleep 2; i=$((i+1))
+    done
+    conf_init
+    chmod 0777 /data/a4 2>/dev/null      # App 要能写 request
+    chmod 0666 "$CONF" 2>/dev/null
+    if [ "$(conf_get AUTO)" = "1" ]; then
+        log "boot: AUTO=1, applying"
+        do_on >/dev/null 2>&1
+    else
+        log "boot: AUTO=0, skip (手动执行 a4-uv on 或 App 里点一下)"
+    fi
+    write_status
+}
+
+# 执行一条请求（由 watch 调用；watch 已是 root）
+run_request() {
+    if [ "$(id -u)" != "0" ]; then
+        log "request: not root, ignored"
+        rm -f "$REQ" 2>/dev/null
+        return 1
+    fi
+    r=$(cat "$REQ" 2>/dev/null | tr -d '\r\n ')
+    rm -f "$REQ" 2>/dev/null
+    [ -z "$r" ] && return 0
+    log "request: $r"
+    case "$r" in
+        on)        do_on    >/dev/null 2>&1 ;;
+        off)       do_off   >/dev/null 2>&1 ;;
+        auto-on)   do_auto on  >/dev/null 2>&1 ;;
+        auto-off)  do_auto off >/dev/null 2>&1 ;;
+        refresh)   : ;;
+        *)         log "request: unknown '$r'" ;;
+    esac
+    write_status
+}
+
+do_watch() {
+    # 单实例：已有存活守护就退出
+    if [ -f /data/a4/uv.watch.pid ]; then
+        old=$(cat /data/a4/uv.watch.pid 2>/dev/null)
+        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+            echo "watch 已在运行 (pid $old)"
+            exit 0
+        fi
+    fi
+    echo $$ > /data/a4/uv.watch.pid 2>/dev/null
+    log "watch: started (pid $$)"
+    while :; do
+        [ -f "$REQ" ] && run_request
+        sleep 2
+    done
+}
+
+case "${1:-status}" in
+    status) do_status ;;
+    on)     do_on  || exit 1 ;;
+    off)    do_off || exit 1 ;;
+    auto)   shift; do_auto "$1" ;;
+    temp)   grep -E 'temperature' "$PMCPU" 2>/dev/null | head -2 ;;
+    boot)   do_boot ;;
+    watch)  do_watch ;;
+    request) run_request ;;
+    *)
+        sed -n '4,26p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+esac

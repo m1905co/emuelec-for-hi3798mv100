@@ -1,0 +1,72 @@
+#!/bin/sh
+# a4-perf - 一键切换 CPU 频率上限（供集成显卡盒/EmuELEC 使用）
+#
+# 部署：/usr/bin/a4-perf（755）    配置：/storage/.config/emuelec/configs/a4-perf.conf
+#
+# 用法：
+#   a4-perf show            查看当前频率/电压/温度/上限
+#   a4-perf 600             上限 600MHz（最低功耗，实测 47fps，街机可用）
+#   a4-perf 1000            上限 1.0GHz（默认，实测 50fps 撞显示上限）
+#   a4-perf 1200            上限 1.2GHz
+#   a4-perf 1500            上限 1.5GHz（最高，玩大游戏用；注意温度会显著上升）
+#   a4-perf auto            恢复 ondemand（600↔conf 上限之间自动）
+#   a4-perf performance     锁定最高频（不推荐长时间用，电压被拉到 1495mV，实测 82°C）
+#
+# 说明：本板只有 600/1000/1200/1500 四档（scaling_available_frequencies）。
+#       实测电压：600M=1040mV / 1.0G=1140mV / 1.2G=1270mV；performance 会拉 1495mV。
+#       GPU 频率在本机不可控（/proc/hisi/msp/pm_gpu 只读，无 devfreq，DVFS 固定 200MHz）。
+
+D=/sys/devices/system/cpu/cpu0/cpufreq
+OD=/sys/devices/system/cpu/cpufreq/ondemand
+CONF=/storage/.config/emuelec/configs/a4-perf.conf
+
+save_conf() {
+    mkdir -p "$(dirname "$CONF")" 2>/dev/null
+    {
+        echo "# a4-perf 配置（由 a4-perf 命令改写；也可手动编辑，下次开机生效）"
+        echo "MAX_FREQ=$1"
+        echo "GOVERNOR=$2"
+    } >"$CONF"
+    sync
+}
+
+apply() {
+    MAXF=$1
+    GOV=$2
+    [ -w "$D/scaling_max_freq" ] || { echo "a4-perf: $D 不可写（不是 root？）"; exit 1; }
+    # 先降 max 再切 governor，避免 governor 在中间态拉到更高频
+    echo "$MAXF" >"$D/scaling_max_freq" 2>/dev/null
+    echo "$GOV"  >"$D/scaling_governor" 2>/dev/null
+    if [ "$GOV" = "ondemand" ]; then
+        echo 70    >"$OD/up_threshold"         2>/dev/null
+        echo 20000 >"$OD/sampling_rate"        2>/dev/null
+        echo 4     >"$OD/sampling_down_factor" 2>/dev/null
+    fi
+    echo "a4-perf: max=$MAXF governor=$GOV"
+}
+
+show() {
+    echo "governor : $(cat "$D/scaling_governor" 2>/dev/null)"
+    echo "cur_freq : $(cat "$D/scaling_cur_freq" 2>/dev/null)"
+    echo "min/max  : $(cat "$D/scaling_min_freq" 2>/dev/null) / $(cat "$D/scaling_max_freq" 2>/dev/null)"
+    grep -E 'freq|volt|temperature' /proc/hisi/msp/pm_cpu 2>/dev/null
+    grep -E 'Frequency|Voltage|DVFS' /proc/hisi/msp/pm_gpu 2>/dev/null
+    [ -f "$CONF" ] && { echo "--- $CONF ---"; cat "$CONF"; }
+}
+
+case "${1:-show}" in
+show|"")        show ;;
+600|1000|1200|1500)
+                # 600 表示 600MHz 上限，其余按 MHz 数直接换算
+                if [ "$1" = "600" ]; then MAXF=600000; else MAXF=$(($1 * 1000)); fi
+                save_conf "$MAXF" ondemand
+                apply "$MAXF" ondemand
+                ;;
+auto)           MAXF=$(sed -n 's/^MAX_FREQ=//p' "$CONF" 2>/dev/null)
+                [ -n "$MAXF" ] || MAXF=1000000
+                apply "$MAXF" ondemand ;;
+performance)    save_conf 1500000 performance
+                apply 1500000 performance ;;
+*)              echo "usage: a4-perf {show|600|1000|1200|1500|auto|performance}"; exit 1 ;;
+esac
+exit 0

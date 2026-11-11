@@ -1,0 +1,29 @@
+Copyright (c) 2024-2026 The A4 EmuELEC Project
+All rights reserved.
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+--------------------------------------------------------------------------
+许可证说明（混合来源）
+--------------------------------------------------------------------------
+本仓库采用 0BSD 仅覆盖“本项目原创”的代码与文档（见上方条款）。
+
+对于以下第三方组件的修改/使用，请遵守其各自的上游许可证：
+  * EmuELEC / LibreELEC / CoreELEC  —— 主要 GPLv2
+  * RetroArch / libretro            —— GPLv2 / LGPLv2.1 等
+  * libMali (ARM) / 海思 OMX        —— 芯片厂专有，不随本仓库分发
+  * 各 libretro 核心                —— 各自许可证（混合）
+
+本仓库以“源码补丁 + 构建配方 + 设备覆盖文件”的形式满足 GPL 的
+“提供对应源码”要求；专有二进制 blob 一律不入库，请使用者自行从
+自己合法拥有的设备或官方 SDK 中提取（见 build/fetch-blobs.sh）。

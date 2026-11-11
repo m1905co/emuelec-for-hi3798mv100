@@ -1,0 +1,234 @@
+#!/bin/sh
+# S87wifi - RTL8188EU USB WiFi bring-up（可配置版）
+#
+# 部署：/etc/init.d/S87wifi
+#
+# ★ WiFi 凭据在这里改（唯一入口，不用再去 /opt/wifi 翻文件）：
+#     /storage/.config/emuelec/configs/wifi.conf
+#         SSID=PandoraBox
+#         PSK=你的密码
+#         # HIDDEN=1        (可选，隐藏 SSID 时填 1)
+#
+# 本脚本每次启动会据此**重新生成** /opt/wifi/wpa_supplicant.conf；
+# 若 wifi.conf 不存在或为空，则沿用 /opt/wifi/wpa_supplicant.conf 原有内容（向后兼容）。
+#
+# 手动操作：
+#   S87wifi restart   # 改完 wifi.conf 后重连（前台跑，能看到过程）
+#   S87wifi status    # 看 IP / 关联状态 / 最近日志
+#
+# 日志：/storage/ee/logs/wifi.log（每次启动重写）、/storage/ee/logs/wpa_supplicant.log
+KO=/lib/modules/4.4.35_ecoo_81082668/kernel/drivers/wifi/usb_rtl8188eu/rtl8188eu.ko
+D=/opt/wifi
+LDR=$D/lib/ld-2.31.so
+SCONF=$D/wpa_supplicant.conf
+UConf=/storage/.config/emuelec/configs/wifi.conf
+LOG=/storage/ee/logs/wifi.log
+WLOG=/storage/ee/logs/wpa_supplicant.log
+# 安卓 data 分区：eMMC 偏移 1365245952（= loop0 的 offset，已实测）
+AND_OFF=1365245952
+AND_LOOP=/dev/loop7
+AND_TMP=/tmp/and
+
+log() { echo "$(cut -d' ' -f1 /proc/uptime) $*" >>"$LOG" 2>/dev/null; }
+
+# 找到（必要时临时挂载）安卓的 wpa_supplicant.conf，失败返回非 0
+find_android_conf() {
+    for p in /mnt/android /storage/android-roms "$AND_TMP"; do
+        if [ -f "$p/misc/wifi/wpa_supplicant.conf" ]; then
+            echo "$p/misc/wifi/wpa_supplicant.conf"
+            return 0
+        fi
+    done
+    # 还没挂载：自己按偏移挂一个只读的
+    losetup -d "$AND_LOOP" 2>/dev/null
+    losetup "$AND_LOOP" -o "$AND_OFF" /dev/mmcblk0 2>/dev/null || return 1
+    mkdir -p "$AND_TMP" 2>/dev/null
+    if mount -o ro,noload "$AND_LOOP" "$AND_TMP" 2>/dev/null; then
+        if [ -f "$AND_TMP/misc/wifi/wpa_supplicant.conf" ]; then
+            log "android: mounted read-only at $AND_TMP"
+            echo "$AND_TMP/misc/wifi/wpa_supplicant.conf"
+            return 0
+        fi
+    fi
+    umount "$AND_TMP" 2>/dev/null
+    losetup -d "$AND_LOOP" 2>/dev/null
+    return 1
+}
+
+release_android() {
+    umount "$AND_TMP" 2>/dev/null
+    losetup -d "$AND_LOOP" 2>/dev/null
+}
+
+gen_conf() {
+    EConf=/storage/.config/emuelec/configs/emuelec.conf
+    es_en=$(sed -n 's/^wifi\.enabled=//p' "$EConf" 2>/dev/null | head -1)
+    es_s=$(sed -n 's/^wifi\.ssid=//p'    "$EConf" 2>/dev/null | head -1)
+    es_p=$(sed -n 's/^wifi\.key=//p'     "$EConf" 2>/dev/null | head -1)
+    u_s=$(sed -n 's/^SSID=//p'   "$UConf" 2>/dev/null | head -1)
+    u_p=$(sed -n 's/^PSK=//p'    "$UConf" 2>/dev/null | head -1)
+    u_h=$(sed -n 's/^HIDDEN=//p' "$UConf" 2>/dev/null | head -1)
+
+    if [ "$es_en" = "0" ]; then
+        log "cfg: wifi disabled in ES (wifi.enabled=0)"
+        return 2
+    fi
+
+    AConf=$(find_android_conf)
+    if [ -z "$AConf" ]; then
+        log "cfg: android data not reachable, skip import"
+    fi
+
+    mkdir -p "$D" 2>/dev/null
+    [ -f "$SCONF.orig" ] || cp -f "$SCONF" "$SCONF.orig" 2>/dev/null
+
+    {
+        echo "ctrl_interface=/var/run/wpa_supplicant"
+        echo "update_config=1"
+
+        # 1) 安卓里保存过的全部网络，原样搬过来
+        if [ -n "$AConf" ] && [ -f "$AConf" ]; then
+            echo
+            awk '
+                /^[ \t]*network[ \t]*=[ \t]*\{/ { f = 1 }
+                f { print }
+                f && /^[ \t]*\}[ \t]*$/ { f = 0 }
+            ' "$AConf" 2>/dev/null
+        fi
+
+        # 2) 手动/ES 界面配置的那个，优先级更高
+        s=; p=; src=
+        if [ -n "$u_s" ] && [ -n "$u_p" ]; then
+            s=$u_s; p=$u_p; src="wifi.conf"
+        elif [ -n "$es_s" ] && [ -n "$es_p" ]; then
+            s=$es_s; p=$es_p; src="emuelec.conf (ES 界面)"
+        fi
+        if [ -n "$s" ] && [ -n "$p" ]; then
+            # 安卓里已经有同名网络就不重复加
+            if [ -n "$AConf" ] && [ -f "$AConf" ] && grep -q "ssid=\"$s\"" "$AConf" 2>/dev/null; then
+                src="$src (dup, skipped)"
+                s=; p=
+            fi
+        fi
+        if [ -n "$s" ] && [ -n "$p" ]; then
+            echo
+            echo "network={"
+            echo "        ssid=\"$s\""
+            echo "        psk=\"$p\""
+            echo "        key_mgmt=WPA-PSK"
+            [ "$u_h" = "1" ] && echo "        scan_ssid=1"
+            echo "        priority=5"
+            echo "}"
+            # 手动配置与安卓那份一致时，不需要重复回写
+            if [ "$src" != "wifi.conf" ]; then
+                {
+                    echo "# 自动同步自 emuelec.conf（ES 界面的 NETWORK SETTINGS）"
+                    echo "SSID=$s"
+                    echo "PSK=$p"
+                    [ "$u_h" = "1" ] && echo "HIDDEN=1"
+                } >"$UConf" 2>/dev/null
+            fi
+        fi
+    } >"$SCONF"
+
+    n_and=0
+    [ -n "$AConf" ] && n_and=$(grep -c '^[ \t]*network' "$AConf" 2>/dev/null || echo 0)
+    log "cfg: android=$n_and manual=${s:-none} source=${src:-none}"
+    release_android
+    return 0
+}
+
+bringup() {
+    log "wifi: start"
+    gen_conf
+    [ $? -eq 2 ] && { log "wifi: skipped (disabled)"; return 0; }
+
+    if [ ! -x "$D/bin/wpa_supplicant" ]; then log "wifi: FAIL no supplicant"; return 1; fi
+    if [ ! -f "$KO" ]; then log "wifi: FAIL module missing"; return 1; fi
+
+    n=0
+    while [ $n -lt 3 ]; do
+        insmod "$KO" >>"$LOG" 2>&1
+        log "wifi: insmod rc=$? (attempt $((n+1)))"
+        [ -e /sys/class/net/wlan0 ] && break
+        n=$((n + 1)); sleep 2
+    done
+
+    i=0
+    while [ $i -lt 30 ] && [ ! -e /sys/class/net/wlan0 ]; do sleep 1; i=$((i + 1)); done
+    if [ ! -e /sys/class/net/wlan0 ]; then
+        log "wifi: FAIL wlan0 never appeared (${i}s)"
+        dmesg 2>/dev/null | grep -iE '8188|rtl8' | tail -8 >>"$LOG" 2>&1
+        return 1
+    fi
+    log "wifi: wlan0 present after ${i}s"
+    ip link set wlan0 up 2>/dev/null || log "wifi: ip link up FAILED"
+
+    mkdir -p /var/run/wpa_supplicant 2>/dev/null
+    chmod 755 /var/run/wpa_supplicant 2>/dev/null
+    pkill -f 'wpa_supplicant.*wlan0' 2>/dev/null
+    sleep 1
+    : >"$WLOG" 2>/dev/null
+    "$LDR" --library-path "$D/lib" "$D/bin/wpa_supplicant" \
+        -Dnl80211 -iwlan0 -c"$SCONF" -B -f "$WLOG" 2>>"$LOG"
+    log "wifi: supplicant rc=$?"
+
+    j=0
+    while [ $j -lt 20 ]; do
+        s=$("$LDR" --library-path "$D/lib" "$D/bin/iw" dev wlan0 link 2>/dev/null | grep -c 'Connected to')
+        [ "$s" = "1" ] && break
+        sleep 1; j=$((j + 1))
+    done
+    if [ "$s" = "1" ]; then
+        log "wifi: associated after ${j}s"
+    else
+        log "wifi: NOT associated after ${j}s; nearby APs:"
+        "$LDR" --library-path "$D/lib" "$D/bin/iw" dev wlan0 scan 2>/dev/null \
+            | grep -E 'SSID:' | head -10 >>"$LOG" 2>&1
+        tail -6 "$WLOG" >>"$LOG" 2>&1
+    fi
+
+    k=0
+    while [ $k -lt 2 ]; do
+        udhcpc -i wlan0 -n -q -t 5 -T 3 >>"$LOG" 2>&1
+        ip4=$(ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2)
+        [ -n "$ip4" ] && break
+        k=$((k + 1)); sleep 3
+    done
+    if [ -n "$ip4" ]; then
+        log "wifi: OK ip=$ip4"
+        return 0
+    fi
+    log "wifi: FAIL no IPv4"
+    return 1
+}
+
+case "${1:-start}" in
+start)
+    mkdir -p /storage/ee/logs 2>/dev/null
+    : >"$LOG" 2>/dev/null
+    ( bringup ) &
+    ;;
+restart)
+    mkdir -p /storage/ee/logs 2>/dev/null
+    : >"$LOG" 2>/dev/null
+    pkill -f 'wpa_supplicant.*wlan0' 2>/dev/null
+    ip addr flush dev wlan0 2>/dev/null
+    bringup
+    cat "$LOG"
+    ;;
+status)
+    echo "--- ip ---"
+    ip -4 addr show wlan0 2>/dev/null | grep -E 'inet |state'
+    echo "--- link ---"
+    "$LDR" --library-path "$D/lib" "$D/bin/iw" dev wlan0 link 2>/dev/null | head -6
+    echo "--- config ---"
+    cat "$UConf" 2>/dev/null || echo "(无 $UConf，使用 $SCONF)"
+    echo "--- log ---"
+    tail -12 "$LOG" 2>/dev/null
+    ;;
+*)
+    echo "usage: $0 {start|restart|status}"
+    ;;
+esac
+exit 0

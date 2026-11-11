@@ -1,0 +1,104 @@
+#!/bin/sh
+# a4-wifi — EmuELEC WiFi 配置工具（配合 /etc/init.d/S93wifi 使用）
+#
+# 用法:
+#   a4-wifi status               当前连接与 IP
+#   a4-wifi scan                 扫描周边 WiFi（SSID / 信号 / 加密）
+#   a4-wifi set <SSID> <密码>    写入配置并立即重连
+#   a4-wifi restart              用当前配置重连
+#
+# 说明:
+#   写入会同时更新两处，保证 ES 界面与命令行一致：
+#     /storage/.config/emuelec/configs/emuelec.conf   wifi.enabled / wifi.ssid / wifi.key
+#     /storage/.config/emuelec/configs/wifi.conf      SSID / PSK
+#   S87wifi 启动时优先读 emuelec.conf（ES 界面的 NETWORK SETTINGS 写的就是它）。
+#
+#   日志: /storage/ee/logs/wifi.log
+
+D=/opt/wifi
+LDR=$D/lib/ld-2.31.so
+EConf=/storage/.config/emuelec/configs/emuelec.conf
+UConf=/storage/.config/emuelec/configs/wifi.conf
+LOG=/storage/ee/logs/wifi.log
+
+iw_() { "$LDR" --library-path "$D/lib" "$D/bin/iw" "$@" 2>/dev/null; }
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+get_ip() { ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2; }
+
+do_status() {
+    echo "--- IP ---"
+    ip4=$(get_ip)
+    [ -n "$ip4" ] && echo "wlan0  $ip4" || echo "wlan0  (无地址)"
+    echo "--- 关联 ---"
+    iw_ dev wlan0 link | sed -n '1,6p'
+    echo "--- 配置 (emuelec.conf, ES 界面) ---"
+    grep -E '^wifi\.(enabled|ssid|key)=' "$EConf" 2>/dev/null | sed 's/^wifi\.key=.*/wifi.key=******/'
+    echo "--- 配置 (wifi.conf, 命令行) ---"
+    [ -f "$UConf" ] && sed 's/^PSK=.*/PSK=******/' "$UConf" || echo "(无)"
+    echo "--- 最近日志 ---"
+    tail -8 "$LOG" 2>/dev/null
+}
+
+do_scan() {
+    ip link set wlan0 up 2>/dev/null
+    sleep 1
+    echo "扫描中（约 4 秒）..."
+    iw_ dev wlan0 scan | awk '
+        function emit() {
+            if (ssid == "") return
+            printf "%-32s %8s dBm  %s\n", ssid, sig, enc
+        }
+        /^BSS / { emit(); ssid=""; sig="?"; enc="开放"; next }
+        /^[ \t]+signal:/ { sig = $2 }
+        /^[ \t]+RSN:/    { enc = "WPA2" }
+        /^[ \t]+WPA:/    { if (enc == "开放") enc = "WPA" }
+        /^[ \t]+WEP:/    { if (enc == "开放") enc = "WEP" }
+        /^[ \t]+SSID:/   {
+            s = $0
+            sub(/^[ \t]+SSID:[ \t]*/, "", s)
+            ssid = s
+        }
+        END { emit() }
+    '
+}
+
+do_set() {
+    s=$1
+    p=$2
+    [ -n "$s" ] && [ -n "$p" ] || { echo "需要 SSID 和密码"; usage; exit 2; }
+    [ -f "$EConf" ] || { echo "找不到 $EConf"; exit 1; }
+
+    # 去掉旧的三行，再统一追加，避免重复键
+    sed -i '/^wifi\.enabled=/d; /^wifi\.ssid=/d; /^wifi\.key=/d' "$EConf"
+    {
+        echo "wifi.enabled=1"
+        echo "wifi.ssid=$s"
+        echo "wifi.key=$p"
+    } >>"$EConf"
+
+    {
+        echo "# 由 a4-wifi 写入"
+        echo "SSID=$s"
+        echo "PSK=$p"
+    } >"$UConf"
+    sync
+
+    echo "已写入: SSID=$s"
+    echo "正在重连..."
+    /etc/init.d/S93wifi restart
+}
+
+case "${1:-}" in
+    status)  do_status ;;
+    scan)    do_scan ;;
+    set)     shift; do_set "$1" "$2" ;;
+    restart) /etc/init.d/S93wifi restart ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac

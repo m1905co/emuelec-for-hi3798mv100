@@ -1,0 +1,41 @@
+#!/bin/sh
+# a4-exitd —— 手柄"退出游戏"守护（LB+Start / R3+Start）
+#
+# 背景：这台机器上的 RetroArch 1.9 里 input_exit_emulator_btn 配什么都不触发
+# （8 个候选热键 × Start 全试过，一次都没退出去），但热键本身是活的（能开菜单），
+# 所以改成在 evdev 层看按键：命中组合就 kill retroarch，
+# 由 histb-emuelec-supervisor 把 EmulationStation 拉回来。
+#
+# 只读 /dev/input/event0，不 grab，不抢 RetroArch 的键。
+# 日志：/storage/ee/logs/exit.log
+
+EXITD=/usr/bin/a4-exitd
+DEV=/dev/input/event0
+PIDF=/var/run/a4-exitd.pid
+
+case "${1:-start}" in
+    start)
+        [ -x "$EXITD" ] || exit 0
+        [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null && exit 0
+        busybox setsid "$EXITD" "$DEV" >/dev/null 2>&1 </dev/null &
+        sleep 1
+        for p in /proc/[0-9]*; do
+            c=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)
+            case "$c" in *a4-exitd*) echo "${p#/proc/}" >"$PIDF" ;; esac
+        done
+        ;;
+    stop)
+        [ -f "$PIDF" ] && kill "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null
+        rm -f "$PIDF"
+        for p in /proc/[0-9]*; do
+            c=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)
+            case "$c" in *a4-exitd*) kill "${p#/proc/}" 2>/dev/null ;; esac
+        done
+        ;;
+    status)
+        [ -f "$PIDF" ] && echo "a4-exitd pid=$(cat "$PIDF")" || echo "a4-exitd not running"
+        busybox tail -5 /storage/ee/logs/exit.log 2>/dev/null
+        ;;
+    *) ;;
+esac
+exit 0

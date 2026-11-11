@@ -1,0 +1,104 @@
+#!/bin/sh
+# a4-pad — 手柄按键映射查看 / 自检 / 一键交换
+#
+# 用法:
+#   a4-pad show          查看三处映射（SDL 库 / RetroArch / ES 界面）
+#   a4-pad test [秒]     监听当前实体手柄，实时打印按下的按键编号
+#   a4-pad swapxy        交换 X 和 Y
+#   a4-pad swapab        交换 A 和 B
+#   a4-pad restore       从 .bak-a4pad 恢复
+#
+# 说明:
+#   游戏内 = /opt/emuelec/share/retroarch/autoconfig/sdl2/<name>.cfg
+#   游戏外 = /storage/ee/config/.emulationstation/es_input.cfg
+#   SDL 映射库 = /opt/emuelec/share/sdl/gamecontrollerdb.txt（只读参考，不改）
+
+A=/opt/emuelec/share/retroarch/autoconfig/sdl2
+ESCFG=/storage/ee/config/.emulationstation/es_input.cfg
+GCDB=/opt/emuelec/share/sdl/gamecontrollerdb.txt
+PAD="ZhiXu Gamepad"
+PADCFG="$A/ZhiXu Gamepad.cfg"
+
+pad_event() {
+    n=$(grep -n "Name=\"$PAD\"" /proc/bus/input/devices 2>/dev/null | cut -d: -f1 | head -1)
+    [ -n "$n" ] || return 1
+    sed -n "${n},$((n + 8))p" /proc/bus/input/devices | grep -o 'event[0-9]*' | head -1
+}
+
+do_show() {
+    echo "=== SDL 映射库（物理键 -> SDL 编号，只读） ==="
+    if grep -q "$PAD" "$GCDB" 2>/dev/null; then
+        grep "$PAD" "$GCDB" | tr ',' '\n' | grep -E '^(a|b|x|y|start|back):'
+    else
+        guid=$(grep -o "deviceGUID=\"[^\"]*\"" "$ESCFG" 2>/dev/null | head -1)
+        echo "(库中无 '$PAD' 名称条目，按 GUID 查)"
+        grep -i '1c18000011010000' "$GCDB" | tr ',' '\n' | grep -E '^(a|b|x|y|start|back):'
+    fi
+
+    echo "=== 游戏内：RetroArch autoconfig ==="
+    grep -E '^input_(a|b|x|y|start|select)_btn' "$PADCFG" 2>/dev/null
+
+    echo "=== 游戏外：ES es_input.cfg ==="
+    awk -v pad="deviceName=\"$PAD\"" '
+        index($0, pad) { f = 1 }
+        f && /<input name="(a|b|x|y|start|select)"/ { print "  " $0 }
+        f && /<\/inputConfig>/ { exit }
+    ' "$ESCFG" 2>/dev/null
+}
+
+do_test() {
+    secs=${1:-20}
+    ev=$(pad_event) || { echo "找不到 '$PAD' 的 event 设备（手柄插好了吗？）"; exit 1; }
+    echo "监听 /dev/input/$ev 共 ${secs} 秒 —— 请现在依次按下 A、B、X、Y"
+    echo "（结束后把输出发给我，或自己对照上面的映射表）"
+    echo "-------------------------------------------------"
+    timeout "$secs" /storage/a4-evinfo "/dev/input/$ev"
+    echo "-------------------------------------------------"
+    echo "完了。"
+}
+
+swap_pair() {
+    k1=$1
+    k2=$2
+    [ -f "$PADCFG" ] || { echo "缺 $PADCFG"; exit 1; }
+    cp -f "$PADCFG" "$PADCFG.bak-a4pad" 2>/dev/null
+    [ -f "$ESCFG" ] && cp -f "$ESCFG" "$ESCFG.bak-a4pad" 2>/dev/null
+
+    # autoconfig: 交换 input_<k>_btn 的值
+    v1=$(sed -n "s/^input_${k1}_btn = \"\\([0-9]*\\)\"/\\1/p" "$PADCFG" | head -1)
+    v2=$(sed -n "s/^input_${k2}_btn = \"\\([0-9]*\\)\"/\\1/p" "$PADCFG" | head -1)
+    if [ -z "$v1" ] || [ -z "$v2" ]; then
+        echo "autoconfig 里没找到 ${k1}/${k2} 的数字值，放弃"
+        exit 1
+    fi
+    sed -i "s/^input_${k1}_btn = \"$v1\"/input_${k1}_btn = \"$v2\"/; s/^input_${k2}_btn = \"$v2\"/input_${k2}_btn = \"$v1\"/" "$PADCFG"
+
+    # ES: 交换 <input name="k" ... id="N" />
+    if [ -f "$ESCFG" ]; then
+        python_swap 2>/dev/null || \
+        sed -i "s/name=\"${k1}\" type=\"button\" id=\"${v1}\"/name=\"${k1}\" type=\"button\" id=\"__TMP__\"/g; s/name=\"${k2}\" type=\"button\" id=\"${v2}\"/name=\"${k2}\" type=\"button\" id=\"${v1}\"/g; s/name=\"${k1}\" type=\"button\" id=\"__TMP__\"/name=\"${k1}\" type=\"button\" id=\"${v2}\"/g" "$ESCFG"
+    fi
+
+    sync
+    echo "已交换 ${k1}(${v1}) <-> ${k2}(${v2})"
+    echo "下一步进一局游戏确认；不满意就执行: a4-pad restore"
+}
+
+python_swap() { return 1; }
+
+do_restore() {
+    [ -f "$PADCFG.bak-a4pad" ] && cp -f "$PADCFG.bak-a4pad" "$PADCFG" && echo "autoconfig 已恢复"
+    [ -f "$ESCFG.bak-a4pad" ]  && cp -f "$ESCFG.bak-a4pad"  "$ESCFG"  && echo "es_input.cfg 已恢复"
+    sync
+}
+
+case "${1:-show}" in
+    show)    do_show ;;
+    test)    shift; do_test "$1" ;;
+    swapxy)  swap_pair x y ;;
+    swapab)  swap_pair a b ;;
+    restore) do_restore ;;
+    *)
+        sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+esac

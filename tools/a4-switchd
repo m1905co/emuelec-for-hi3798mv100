@@ -1,0 +1,77 @@
+#!/system/bin/sh
+# a4-switchd - root-side dual-boot switcher daemon (Android -> EmuELEC, etc.)
+#
+# Why this exists:
+#   The A4 DualBoot app runs as an unprivileged app (uid 10xxx).  On this ROM
+#   `su` is SuperSU's, but the SuperSU *manager* app is not installed, so app
+#   requests for root are silently denied.  Instead of fighting su, the app
+#   drops a request file and this root daemon (started at boot from
+#   /system/etc/install-recovery.sh) performs the privileged part.
+#
+# Protocol (write-only, unprivileged):
+#   echo emuelec > /data/a4/switch.request    -> write EmuELEC env block + reboot
+#   echo android > /data/a4/switch.request    -> write Android env block + reboot
+#   echo recovery> /data/a4/switch.request    -> write misc=boot-recovery + reboot
+#   echo reboot  > /data/a4/switch.request    -> plain reboot of Android
+#
+# Only these three fixed targets are accepted; the request file is consumed
+# (deleted) before the action runs so a stale file can never re-trigger.
+
+REQ=/data/a4/switch.request
+LOG=/data/a4/a4-switchd.log
+PIDF=/data/a4/a4-switchd.pid
+
+# Android 4.4 toolbox is minimal (no tr/sed/printf); use busybox explicitly.
+# It lives in /system/bin on this ROM (also reachable as plain "busybox" via
+# PATH, but the daemon may run with a minimal environment so pin the path).
+BB=/system/bin/busybox
+[ -x "${BB}" ] || BB=busybox
+
+log() { echo "$($BB date '+%m-%d %H:%M:%S') $*" >>"${LOG}" 2>/dev/null; }
+
+# --- single instance guard -------------------------------------------------
+if [ -f "${PIDF}" ]; then
+    old=$($BB cat "${PIDF}" 2>/dev/null)
+    if [ -n "${old}" ] && kill -0 "${old}" 2>/dev/null; then
+        # 静默退出：install-recovery 的看门狗每 3 秒会重新拉一次，
+        # 这里如果写日志会以 3 秒/行的速度刷爆 a4-switchd.log
+        exit 0
+    fi
+fi
+echo $$ >"${PIDF}"
+log "a4-switchd started (pid $$)"
+# 丢弃上一次遗留的请求，避免开机瞬间执行陈旧指令
+rm -f "${REQ}"
+
+while true; do
+    if [ -f "${REQ}" ]; then
+        target=$($BB cat "${REQ}" 2>/dev/null | $BB tr -d ' \t\r\n')
+        rm -f "${REQ}"
+        case "${target}" in
+            emuelec)
+                log "request: switch to EmuELEC"
+                /data/a4/switch-to-emuelec >>"${LOG}" 2>&1
+                log "switch-to-emuelec exited $?"
+                ;;
+            android)
+                log "request: switch to Android"
+                /data/a4/switch-to-android >>"${LOG}" 2>&1
+                log "switch-to-android exited $?"
+                ;;
+            recovery)
+                log "request: reboot to recovery"
+                /data/a4/a4-os-switch recovery >>"${LOG}" 2>&1
+                log "a4-os-switch recovery exited $?"
+                ;;
+            reboot)
+                log "request: reboot Android"
+                sync
+                (sleep 1; reboot) &
+                ;;
+            *)
+                log "ignoring unknown request '${target}'"
+                ;;
+        esac
+    fi
+    sleep 1
+done

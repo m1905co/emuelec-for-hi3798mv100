@@ -1,0 +1,268 @@
+#!/bin/sh
+# a4-menu — 在 ES 首页生成「Network」「CPU Speed」两个入口，并显示当前状态
+#
+# 做法：用 es_systems.cfg 注册两个 system，目录里每个 .sh 就是一个可点条目，
+#       command 是 /bin/sh %ROM%，与自带的 switchos / diagnostics 完全同构。
+#
+# 状态怎么"看得出来"（v2 改进）：
+#   1) 系统名带状态：`CPU Speed · 1000MHz` / `Network · PandoraBox`
+#   2) 列表里当前挡位带 `★当前`，描述里写 `● 当前正在使用：xxx`
+#   3) 每个条目点完后 → 改配置 → 重建本菜单 → a4-es-restart 重启前端
+#      （ES 只在启动时读 gamelist，不重启就看不到变化）
+#
+# 运行：a4-menu          # 生成/刷新全部内容与状态（幂等）
+#
+# 目录：/storage/ee/{network,cpufreq}/   每个 .sh 一条
+# 列表：<系统目录>/gamelist.xml（ES 读这里，不是 gamelists/<system>/）
+
+ROOT=/storage/ee
+NET_DIR=$ROOT/network
+CPU_DIR=$ROOT/cpufreq
+PAD_DIR=$ROOT/padcfg
+ESDIR=/storage/ee/config/.emulationstation
+SYSCFG=$ESDIR/es_systems.cfg
+PERFCONF=/storage/.config/emuelec/configs/a4-perf.conf
+LOGDIR=$ROOT/logs
+
+mkdir -p "$NET_DIR" "$CPU_DIR" "$PAD_DIR" "$ESDIR" "$LOGDIR"
+
+rm -f "$NET_DIR"/*.sh "$CPU_DIR"/*.sh 2>/dev/null
+
+cur_freq=$(sed -n 's/^MAX_FREQ=//p' "$PERFCONF" 2>/dev/null | head -1)
+[ -n "$cur_freq" ] || cur_freq=1000000
+cur_mhz=$((cur_freq / 1000))
+cur_ker=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null)
+[ -n "$cur_ker" ] || cur_ker=$cur_freq
+cur_ker_mhz=$((cur_ker / 1000))
+cur_temp=$(grep -oE 'temperature *= *[0-9]+' /proc/hisi/msp/pm_cpu 2>/dev/null | grep -oE '[0-9]+' | head -1)
+[ -n "$cur_temp" ] || cur_temp="?"
+
+cur_ip=$(ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2)
+cur_eth=$(ip -4 addr show eth0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2)
+cur_ssid=$(sed -n 's/^wifi\.ssid=//p' /storage/.config/emuelec/configs/emuelec.conf 2>/dev/null | head -1)
+[ -n "$cur_ssid" ] || cur_ssid=$(grep -m1 'ssid=' /opt/wifi/wpa_supplicant.conf 2>/dev/null | sed 's/.*ssid="\([^"]*\)".*/\1/')
+
+if [ -n "$cur_ip" ]; then
+    NET_LABEL="$cur_ssid"
+elif [ -n "$cur_eth" ]; then
+    NET_LABEL="有线"
+else
+    NET_LABEL="未连接"
+fi
+
+# ---------- CPU 频率条目 ----------
+mk_cpu() {
+    mhz=$1
+    f=$CPU_DIR/cpu-$mhz.sh
+    cat >"$f" <<EOF
+#!/bin/sh
+# 切到 $mhz MHz：改配置 -> 重建菜单 -> 重启前端（否则列表上的★当前不会动）
+/usr/bin/a4-perf $mhz >/dev/null 2>&1
+/usr/bin/a4-menu >/dev/null 2>&1
+/usr/bin/a4-es-restart
+exit 0
+EOF
+    chmod 755 "$f"
+}
+
+cpu_xml=""
+add_cpu_entry() {
+    mhz=$1; note=$2; order=$3
+    if [ "$mhz" = "$cur_mhz" ]; then
+        state="● 当前正在使用：$mhz MHz（实测 ${cur_ker_mhz} MHz / ${cur_temp}°C）"
+        star=" ★当前"
+    else
+        state="按 A 切换到 $mhz MHz"
+        star=""
+    fi
+    cpu_xml="$cpu_xml  <game>
+    <path>./cpu-$mhz.sh</path>
+    <name>$order) $mhz MHz$star</name>
+    <desc>$note
+$state</desc>
+  </game>
+"
+}
+mk_cpu 600
+mk_cpu 1000
+mk_cpu 1200
+mk_cpu 1500
+add_cpu_entry 600  "最省电：47fps / 约 54°C" 1
+add_cpu_entry 1000 "默认：50fps / 约 63°C" 2
+add_cpu_entry 1200 "高性能" 3
+add_cpu_entry 1500 "满血，发热最大" 4
+
+{
+    echo '<?xml version="1.0"?>'
+    echo '<gameList>'
+    printf '%s' "$cpu_xml"
+    echo '</gameList>'
+} >"$CPU_DIR/gamelist.xml"
+
+# ---------- 网络条目 ----------
+mk_net() {
+    name=$1
+    body=$2
+    f=$NET_DIR/$name.sh
+    {
+        echo '#!/bin/sh'
+        printf '%s\n' "$body"
+        echo "/usr/bin/a4-menu >/dev/null 2>&1"
+        echo "/usr/bin/a4-es-restart"
+        echo "exit 0"
+    } >"$f"
+    chmod 755 "$f"
+}
+
+if [ -n "$cur_eth" ]; then
+    eth_state="● 已连接：$cur_eth"
+else
+    eth_state="按 A 启用有线（需插网线）"
+fi
+mk_net net-wired 'ip link set eth0 up 2>/dev/null
+udhcpc -i eth0 -n -q -t 5 >>/storage/ee/logs/net.log 2>&1'
+
+if [ -n "$cur_ip" ]; then
+    wifi_state="● 已连接：$cur_ssid  $cur_ip"
+else
+    wifi_state="按 A 重新连接 $cur_ssid"
+fi
+mk_net net-wifi "/etc/init.d/S93wifi restart >>/storage/ee/logs/net.log 2>&1"
+
+mk_net net-scan '/usr/bin/a4-menu-scan >>/storage/ee/logs/net.log 2>&1'
+
+if [ -d "$NET_DIR" ] && [ -f "$ROOT/nets.list" ]; then
+    while IFS='|' read -r s sig enc known; do
+        [ -n "$s" ] || continue
+        safe=$(echo "$s" | tr -c 'A-Za-z0-9_-' '_')
+        [ "$s" = "$cur_ssid" ] && continue
+        if [ "$known" = "1" ]; then
+            mk_net "wifi-$safe" "/usr/bin/a4-wifi set '$s' \"\$(sed -n 's/^PSK=//p' /storage/.config/emuelec/configs/wifi.conf | head -1)\" >>/storage/ee/logs/net.log 2>&1"
+        fi
+    done <"$ROOT/nets.list"
+fi
+
+net_xml="  <game>
+    <path>./net-wired.sh</path>
+    <name>1) 有线网络</name>
+    <desc>插网线时使用
+$eth_state</desc>
+  </game>
+  <game>
+    <path>./net-wifi.sh</path>
+    <name>2) 无线 (Android 已存)：$cur_ssid</name>
+    <desc>用 Android 里保存的账号密码连接，无需输入
+$wifi_state</desc>
+  </game>
+  <game>
+    <path>./net-scan.sh</path>
+    <name>3) 扫描周边 WiFi</name>
+    <desc>扫描后自动重启前端，扫到的网络会出现在下方</desc>
+  </game>
+"
+
+if [ -f "$ROOT/nets.list" ]; then
+    while IFS='|' read -r s sig enc known; do
+        [ -n "$s" ] || continue
+        safe=$(echo "$s" | tr -c 'A-Za-z0-9_-' '_')
+        [ "$s" = "$cur_ssid" ] && continue
+        [ -f "$NET_DIR/wifi-$safe.sh" ] || continue
+        net_xml="$net_xml  <game>
+    <path>./wifi-$safe.sh</path>
+    <name>4) $s</name>
+    <desc>信号 $sig dBm  $enc
+按 A 连接</desc>
+  </game>
+"
+    done <"$ROOT/nets.list"
+fi
+
+{
+    echo '<?xml version="1.0"?>'
+    echo '<gameList>'
+    printf '%s' "$net_xml"
+    echo '</gameList>'
+} >"$NET_DIR/gamelist.xml"
+
+# ---------- 手柄设置（脚本是静态的，随包放在 /storage/ee/padcfg） ----------
+pad_xml=""
+if [ -d "$PAD_DIR" ]; then
+    for f in "$PAD_DIR"/*.sh; do
+        [ -f "$f" ] || continue
+        b=$(basename "$f" .sh)
+        t=$(sed -n 's/^# TITLE: //p' "$f" | head -1)
+        d=$(sed -n 's/^# DESC: //p' "$f" | head -1)
+        [ -n "$t" ] || t="$b"
+        pad_xml="$pad_xml  <game>
+    <path>./$b.sh</path>
+    <name>$t</name>
+    <desc>$d</desc>
+  </game>
+"
+    done
+fi
+{
+    echo '<?xml version="1.0"?>'
+    echo '<gameList>'
+    printf '%s' "$pad_xml"
+    echo '</gameList>'
+} >"$PAD_DIR/gamelist.xml"
+
+# ---------- 注册到 es_systems.cfg（带状态标题） ----------
+if [ -f "$SYSCFG" ]; then
+    awk '
+        /<system>/ { blk = $0 "\n"; inb = 1; next }
+        inb {
+            blk = blk $0 "\n"
+            if ($0 ~ /<\/system>/) {
+                if (blk !~ /a4network/ && blk !~ /a4cpufreq/ && blk !~ /a4padcfg/) printf "%s", blk
+                inb = 0
+            }
+            next
+        }
+        { print }
+    ' "$SYSCFG" >"$SYSCFG.tmp" && mv -f "$SYSCFG.tmp" "$SYSCFG"
+fi
+
+if [ -f "$SYSCFG" ]; then
+    NET_SHORT=$(echo "$NET_LABEL" | cut -c1-8)
+    awk -v netlabel="$NET_SHORT" -v cpulabel="${cur_mhz}M" '
+        /<systemList>/ && !done {
+            print
+            print "  <system>"
+            print "    <name>a4network</name>"
+            print "    <fullname>Net " netlabel "</fullname>"
+            print "    <path>/storage/ee/network</path>"
+            print "    <extension>.sh .SH</extension>"
+            print "    <command>/bin/sh %ROM%</command>"
+            print "    <platform>ignore</platform>"
+            print "    <theme>ports</theme>"
+            print "  </system>"
+            print "  <system>"
+            print "    <name>a4cpufreq</name>"
+            print "    <fullname>CPU " cpulabel "</fullname>"
+            print "    <path>/storage/ee/cpufreq</path>"
+            print "    <extension>.sh .SH</extension>"
+            print "    <command>/bin/sh %ROM%</command>"
+            print "    <platform>ignore</platform>"
+            print "    <theme>ports</theme>"
+            print "  </system>"
+            print "  <system>"
+            print "    <name>a4padcfg</name>"
+            print "    <fullname>手柄设置</fullname>"
+            print "    <path>/storage/ee/padcfg</path>"
+            print "    <extension>.sh .SH</extension>"
+            print "    <command>/bin/sh %ROM%</command>"
+            print "    <platform>ignore</platform>"
+            print "    <theme>ports</theme>"
+            print "  </system>"
+            done = 1
+            next
+        }
+        { print }
+    ' "$SYSCFG" >"$SYSCFG.new" && mv -f "$SYSCFG.new" "$SYSCFG"
+    sync
+fi
+
+sync
+echo "menu ready: cpu=${cur_mhz}MHz(now ${cur_ker_mhz}MHz/${cur_temp}C) net=${NET_LABEL} wifi_ip=${cur_ip} eth=${cur_eth}"

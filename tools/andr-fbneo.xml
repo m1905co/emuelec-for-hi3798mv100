@@ -1,0 +1,9 @@
+  <system>
+    <name>andr-fbneo</name>
+    <fullname>Android Storage - Arcade (FinalBurn Neo)</fullname>
+    <path>/storage/android-roms/roms/fbneo</path>
+    <extension>.zip .ZIP</extension>
+    <command>${HISTB_EE_ROOT}/bin/run-retroarch.sh fbneo %ROM%</command>
+    <platform>arcade</platform>
+    <theme>mame</theme>
+  </system>

@@ -1,0 +1,35 @@
+#!/bin/sh
+# 开机重建首页菜单（CPU Speed / Network）——保证标题上的状态是最新的
+#
+# 为什么放在 S94：S93wifi 已经把 WiFi 连上（要读 IP），S95 才启动 ES（要读 gamelist）。
+# ES 只在启动时读 es_systems.cfg 与 gamelist.xml，所以必须在这之前把内容刷好。
+#
+# ★ 2026-10-29：S93wifi 返回时往往只是「关联成功」，DHCP 还要 5~15 秒才拿到 IP。
+#   老写法会在这之前生成菜单，首页就永久显示 "Net 未连接"（实测踩到）。
+#   这里最多等 30 秒，拿到 IP（或有线）就立刻生成。
+
+wait_ip() {
+    i=0
+    while [ $i -lt 15 ]; do
+        ip -4 addr show wlan0 2>/dev/null | grep -q 'inet ' && return 0
+        ip -4 addr show eth0 2>/dev/null | grep -q 'inet ' && return 0
+        sleep 2
+        i=$((i + 1))
+    done
+    return 1
+}
+
+case "${1:-start}" in
+    start)
+        if [ -x /usr/bin/a4-menu ]; then
+            wait_ip
+            /usr/bin/a4-menu >>/storage/ee/logs/a4-menu.log 2>&1
+        fi
+        ;;
+    status)
+        grep -o 'CPU [^<]*' /storage/ee/config/.emulationstation/es_systems.cfg 2>/dev/null
+        grep -o 'Net [^<]*' /storage/ee/config/.emulationstation/es_systems.cfg 2>/dev/null
+        ;;
+    *) ;;
+esac
+exit 0

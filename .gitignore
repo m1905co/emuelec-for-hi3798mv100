@@ -1,0 +1,24 @@
+# 构建产物 / 专有二进制（绝不入库）
+*.img
+*.uImage
+*.so
+*.ko
+*.bin
+*.zip
+*.unsign*
+out/
+build/output/
+
+# 密钥 / 私密信息
+*.key
+id_*
+*.pem
+secrets*
+*host_key*
+blobs/
+
+# 本地临时
+*.tmp
+__pycache__/
+*.pyc
+.DS_Store

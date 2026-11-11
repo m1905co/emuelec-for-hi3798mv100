@@ -1,0 +1,268 @@
+#!/bin/sh
+# S87wifi - RTL8188EU USB WiFi bring-up（可配置版）
+#
+# 部署：/etc/init.d/S87wifi
+#
+# ★ WiFi 凭据在这里改（唯一入口，不用再去 /opt/wifi 翻文件）：
+#     /storage/.config/emuelec/configs/wifi.conf
+#         SSID=PandoraBox
+#         PSK=你的密码
+#         # HIDDEN=1        (可选，隐藏 SSID 时填 1)
+#
+# 本脚本每次启动会据此**重新生成** /opt/wifi/wpa_supplicant.conf；
+# 若 wifi.conf 不存在或为空，则沿用 /opt/wifi/wpa_supplicant.conf 原有内容（向后兼容）。
+#
+# 手动操作：
+#   S87wifi restart   # 改完 wifi.conf 后重连（前台跑，能看到过程）
+#   S87wifi status    # 看 IP / 关联状态 / 最近日志
+#
+# 日志：/storage/ee/logs/wifi.log（每次启动重写）、/storage/ee/logs/wpa_supplicant.log
+KO=/lib/modules/4.4.35_ecoo_81082668/kernel/drivers/wifi/usb_rtl8188eu/rtl8188eu.ko
+D=/opt/wifi
+LDR=$D/lib/ld-2.31.so
+SCONF=$D/wpa_supplicant.conf
+UConf=/storage/.config/emuelec/configs/wifi.conf
+LOG=/storage/ee/logs/wifi.log
+WLOG=/storage/ee/logs/wpa_supplicant.log
+# 安卓 data 分区：偏移不写死，运行时自动探测（loop0 -> 缓存 -> 扫描）
+AND_LOOP=/dev/loop7
+AND_TMP=/tmp/and
+AND_CACHE=/storage/.config/emuelec/configs/android-part.conf
+
+log() { echo "$(cut -d' ' -f1 /proc/uptime) $*" >>"$LOG" 2>/dev/null; }
+
+# ---- 安卓 data 分区自动定位 --------------------------------------------------
+# 依次尝试：已挂载点 -> loop0 的 offset -> 缓存文件 -> 全盘扫描
+# 扫描用 hexdump 直接读 ext4 超级块 magic(0xEF53)，命中后挂载验证 misc/wifi 是否存在，
+# 确认后把偏移写进缓存，下次开机直接用。
+
+detect_offset() {
+    # a) loop0 已被 S93a4-androidroms 绑定，直接拿它的 offset
+    o=$(cat /sys/block/loop0/loop/offset 2>/dev/null)
+    if [ -n "$o" ] && [ "$o" != "0" ] 2>/dev/null; then
+        echo "$o"
+        return 0
+    fi
+
+    # b) 上次探测成功的缓存
+    if [ -f "$AND_CACHE" ]; then
+        o=$(sed -n 's/^OFFSET=//p' "$AND_CACHE" 2>/dev/null | head -1)
+        if [ -n "$o" ]; then
+            echo "$o"
+            return 0
+        fi
+    fi
+
+    # c) 扫描
+    o=$(scan_offset)
+    if [ -n "$o" ]; then
+        mkdir -p "$(dirname "$AND_CACHE")" 2>/dev/null
+        echo "OFFSET=$o" >"$AND_CACHE" 2>/dev/null
+        echo "$o"
+        return 0
+    fi
+    return 1
+}
+
+scan_offset() {
+    log "android: scanning for data partition (first boot only)..."
+    mb=100
+    while [ "$mb" -lt 3700 ]; do
+        # 用 awk 算偏移，避开 32 位 shell 算术溢出（>2GB）
+        off=$(awk -v m="$mb" 'BEGIN{printf "%.0f", m*1048576}')
+        pos=$(awk -v m="$mb" 'BEGIN{printf "%.0f", m*1048576+1080}')
+        m=$(hexdump -s "$pos" -n 2 -e '2/1 "%02x"' /dev/mmcblk0 2>/dev/null)
+        if [ "$m" = "53ef" ]; then
+            losetup -d "$AND_LOOP" 2>/dev/null
+            if losetup "$AND_LOOP" -o "$off" /dev/mmcblk0 2>/dev/null; then
+                mkdir -p "$AND_TMP" 2>/dev/null
+                if mount -o ro,noload "$AND_LOOP" "$AND_TMP" 2>/dev/null; then
+                    if [ -d "$AND_TMP/misc/wifi" ]; then
+                        umount "$AND_TMP" 2>/dev/null
+                        losetup -d "$AND_LOOP" 2>/dev/null
+                        log "android: data partition found at ${mb}MB (offset=$off)"
+                        echo "$off"
+                        return 0
+                    fi
+                fi
+                umount "$AND_TMP" 2>/dev/null
+                losetup -d "$AND_LOOP" 2>/dev/null
+            fi
+        fi
+        mb=$((mb + 1))
+    done
+    log "android: scan finished, no data partition with misc/wifi found"
+    return 1
+}
+
+find_android_conf() {
+    # 1) 已经挂好的（S93 之后正常情况都走这里，零成本）
+    for p in /mnt/android /storage/android-roms "$AND_TMP"; do
+        if [ -f "$p/misc/wifi/wpa_supplicant.conf" ]; then
+            echo "$p/misc/wifi/wpa_supplicant.conf"
+            return 0
+        fi
+    done
+
+    # 2) 自己按探测到的偏移挂一个只读的
+    off=$(detect_offset)
+    if [ -z "$off" ]; then
+        log "android: partition not found, skip import"
+        return 1
+    fi
+    losetup -d "$AND_LOOP" 2>/dev/null
+    losetup "$AND_LOOP" -o "$off" /dev/mmcblk0 2>/dev/null || return 1
+    mkdir -p "$AND_TMP" 2>/dev/null
+    if mount -o ro,noload "$AND_LOOP" "$AND_TMP" 2>/dev/null; then
+        if [ -f "$AND_TMP/misc/wifi/wpa_supplicant.conf" ]; then
+            log "android: mounted read-only at $AND_TMP (offset=$off)"
+            echo "$AND_TMP/misc/wifi/wpa_supplicant.conf"
+            return 0
+        fi
+    fi
+    umount "$AND_TMP" 2>/dev/null
+    losetup -d "$AND_LOOP" 2>/dev/null
+    return 1
+}
+
+release_android() {
+    umount "$AND_TMP" 2>/dev/null
+    losetup -d "$AND_LOOP" 2>/dev/null
+}
+
+gen_conf() {
+    EConf=/storage/.config/emuelec/configs/emuelec.conf
+    es_en=$(sed -n 's/^wifi\.enabled=//p' "$EConf" 2>/dev/null | head -1)
+
+    if [ "$es_en" = "0" ]; then
+        log "cfg: wifi disabled in ES (wifi.enabled=0)"
+        return 2
+    fi
+
+    # 唯一来源：安卓里保存的网络。安卓读不到就保持现有配置不动。
+    AConf=$(find_android_conf)
+    if [ -z "$AConf" ] || [ ! -f "$AConf" ]; then
+        log "cfg: android unreachable, keep existing $SCONF"
+        return 0
+    fi
+
+    n=$(grep -c '^[ \t]*network[ \t]*=' "$AConf" 2>/dev/null || echo 0)
+    if [ "$n" = "0" ]; then
+        log "cfg: android has no saved network, keep existing $SCONF"
+        release_android
+        return 0
+    fi
+
+    mkdir -p "$D" 2>/dev/null
+    [ -f "$SCONF.orig" ] || cp -f "$SCONF" "$SCONF.orig" 2>/dev/null
+
+    {
+        echo "ctrl_interface=/var/run/wpa_supplicant"
+        echo "update_config=1"
+        echo
+        awk '
+            /^[ \t]*network[ \t]*=[ \t]*\{/ { f = 1 }
+            f { print }
+            f && /^[ \t]*\}[ \t]*$/ { f = 0 }
+        ' "$AConf" 2>/dev/null
+    } >"$SCONF"
+
+    log "cfg: imported $n network(s) from android only"
+    release_android
+    return 0
+}
+
+bringup() {
+    log "wifi: start"
+    gen_conf
+    [ $? -eq 2 ] && { log "wifi: skipped (disabled)"; return 0; }
+
+    if [ ! -x "$D/bin/wpa_supplicant" ]; then log "wifi: FAIL no supplicant"; return 1; fi
+    if [ ! -f "$KO" ]; then log "wifi: FAIL module missing"; return 1; fi
+
+    n=0
+    while [ $n -lt 3 ]; do
+        insmod "$KO" >>"$LOG" 2>&1
+        log "wifi: insmod rc=$? (attempt $((n+1)))"
+        [ -e /sys/class/net/wlan0 ] && break
+        n=$((n + 1)); sleep 2
+    done
+
+    i=0
+    while [ $i -lt 30 ] && [ ! -e /sys/class/net/wlan0 ]; do sleep 1; i=$((i + 1)); done
+    if [ ! -e /sys/class/net/wlan0 ]; then
+        log "wifi: FAIL wlan0 never appeared (${i}s)"
+        dmesg 2>/dev/null | grep -iE '8188|rtl8' | tail -8 >>"$LOG" 2>&1
+        return 1
+    fi
+    log "wifi: wlan0 present after ${i}s"
+    ip link set wlan0 up 2>/dev/null || log "wifi: ip link up FAILED"
+
+    mkdir -p /var/run/wpa_supplicant 2>/dev/null
+    chmod 755 /var/run/wpa_supplicant 2>/dev/null
+    pkill -f 'wpa_supplicant.*wlan0' 2>/dev/null
+    sleep 1
+    : >"$WLOG" 2>/dev/null
+    "$LDR" --library-path "$D/lib" "$D/bin/wpa_supplicant" \
+        -Dnl80211 -iwlan0 -c"$SCONF" -B -f "$WLOG" 2>>"$LOG"
+    log "wifi: supplicant rc=$?"
+
+    j=0
+    while [ $j -lt 20 ]; do
+        s=$("$LDR" --library-path "$D/lib" "$D/bin/iw" dev wlan0 link 2>/dev/null | grep -c 'Connected to')
+        [ "$s" = "1" ] && break
+        sleep 1; j=$((j + 1))
+    done
+    if [ "$s" = "1" ]; then
+        log "wifi: associated after ${j}s"
+    else
+        log "wifi: NOT associated after ${j}s; nearby APs:"
+        "$LDR" --library-path "$D/lib" "$D/bin/iw" dev wlan0 scan 2>/dev/null \
+            | grep -E 'SSID:' | head -10 >>"$LOG" 2>&1
+        tail -6 "$WLOG" >>"$LOG" 2>&1
+    fi
+
+    k=0
+    while [ $k -lt 2 ]; do
+        udhcpc -i wlan0 -n -q -t 5 -T 3 >>"$LOG" 2>&1
+        ip4=$(ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2)
+        [ -n "$ip4" ] && break
+        k=$((k + 1)); sleep 3
+    done
+    if [ -n "$ip4" ]; then
+        log "wifi: OK ip=$ip4"
+        return 0
+    fi
+    log "wifi: FAIL no IPv4"
+    return 1
+}
+
+case "${1:-start}" in
+start)
+    mkdir -p /storage/ee/logs 2>/dev/null
+    : >"$LOG" 2>/dev/null
+    ( bringup ) &
+    ;;
+restart)
+    mkdir -p /storage/ee/logs 2>/dev/null
+    : >"$LOG" 2>/dev/null
+    pkill -f 'wpa_supplicant.*wlan0' 2>/dev/null
+    ip addr flush dev wlan0 2>/dev/null
+    bringup
+    cat "$LOG"
+    ;;
+status)
+    echo "--- ip ---"
+    ip -4 addr show wlan0 2>/dev/null | grep -E 'inet |state'
+    echo "--- link ---"
+    "$LDR" --library-path "$D/lib" "$D/bin/iw" dev wlan0 link 2>/dev/null | head -6
+    echo "--- config ---"
+    cat "$UConf" 2>/dev/null || echo "(无 $UConf，使用 $SCONF)"
+    echo "--- log ---"
+    tail -12 "$LOG" 2>/dev/null
+    ;;
+*)
+    echo "usage: $0 {start|restart|status}"
+    ;;
+esac
+exit 0

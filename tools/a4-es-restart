@@ -1,0 +1,16 @@
+#!/bin/sh
+# a4-es-restart —— 重启 EmulationStation 前端（由 supervisor 拉起）
+#
+# 为什么需要：ES 只在启动时读 es_systems.cfg 与 gamelist.xml。
+# 菜单里点了 CPU 挡位 / WiFi 之后，如果不重启前端，列表上的「★当前」不会变，
+# 等于"点了看不出有没有生效"。所以每个菜单脚本收尾都调这个。
+#
+# 注意：本脚本是被 ES fork 出来的子进程，杀 ES 之后自己会变成孤儿，正常退出即可。
+
+for p in /proc/[0-9]*; do
+    c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+    case "$c" in
+        *emulationstation*) kill -TERM "${p#/proc/}" 2>/dev/null ;;
+    esac
+done
+exit 0
