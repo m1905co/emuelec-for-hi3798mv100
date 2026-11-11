@@ -3,6 +3,9 @@
 把运营商海思 **Hi3798MV100** 机顶盒（EC6108V9C 等）改造成
 **EmuELEC 游戏系统 + 原生安卓双系统** 的一套工具、补丁与文档。
 
+> **适用机型：EC6108V9C（板级 `mdmo1d`，即"1D 机型"），Hi3798MV100，1GB DDR。**
+> 其它 Hi3798MV100 板型未验证。
+
 > 这是「可开源部分」的子集。专有二进制（内核 / libMali / 海思 OMX / libretro 核心 /
 > 整盘固件）**不在此仓库内**，需按 `build/fetch-blobs.sh` 自行从设备/SDK 提取。
 
@@ -10,7 +13,8 @@
 
 ## 硬件目标
 - SoC: HiSilicon Hi3798MV100（Cortex-A53, Mali-450）
-- 设备: EC6108V9C 系列 IPTV 机顶盒
+- 设备: **EC6108V9C 系列**（板级 `hi3798mdmo1d_hi3798mv100_ddr3_2gbyte_8bitx4_4layers_emmc`，即 **1D 机型**）
+- 内存: 1GB DDR3
 - 存储: eMMC 9 分区 (p1–p9，双系统用 misc 标记切换) + TF 卡
 
 ## 本仓库包含（A 类：可自由使用，0BSD）
@@ -33,6 +37,13 @@
 2. 套用本仓库的补丁与 `ee_files/` 覆盖；
 3. 用 `tools/build_emuelec_standalone.py` 生成独立 recovery 刷机包；
 4. 用 `signapk.jar -w` 对整个 zip 重新签名（EOCD 注释须保留）。
+
+## 致谢 / Acknowledgments
+- 本项目的移植、补丁与双系统改造建立在上游项目 **ghkjgod / emuelec-for-hi3798mv100** 的基础之上：
+  <https://github.com/ghkjgod/emuelec-for-hi3798mv100> —— 感谢原作者的开源工作。
+- 感谢 **EmuELEC**、**LibreELEC**、**RetroArch** 及其所有 libretro 核心作者。
+- 感谢海纳思（ecoo）社区提供的 Hi3798MV100 板级 SDK / U-Boot 基线。
+- 双系统切换、U-Boot、WiFi/蓝牙/红外、HEVC 硬解、热调优等具体攻关过程见 `docs/`。
 
 ## 许可证
 - **本项目原创代码与文档**：0BSD（见 [`LICENSE`](LICENSE)）。
